@@ -40,6 +40,7 @@ import (
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/internal/stringext"
 	"github.com/charmbracelet/crush/internal/ui/anim"
 	"github.com/charmbracelet/crush/internal/ui/attachments"
 	"github.com/charmbracelet/crush/internal/ui/chat"
@@ -259,6 +260,7 @@ type UI struct {
 
 	// pills state
 	pillsExpanded      bool
+	pillsAutoExpanded  bool
 	focusedPillSection pillSection
 	promptQueue        int
 	pillsView          string
@@ -317,6 +319,7 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 			com.Styles.Attachments.Deleting,
 			com.Styles.Attachments.Image,
 			com.Styles.Attachments.Text,
+			com.Styles.Attachments.Skill,
 		),
 		attachments.Keymap{
 			DeleteMode: keyMap.Editor.AttachmentDeleteMode,
@@ -536,6 +539,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.setSessionMessages(msgs); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+		if cmd := m.autoExpandPillsIfReasonable(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		if hasInProgressTodo(m.session.Todos) {
 			// only start spinner if there is an in-progress todo
 			if m.isAgentBusy() {
@@ -611,6 +617,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.todoSpinner.Tick)
 				m.updateLayoutAndSize()
 			}
+			m.autoExpandPillsIfReasonable()
 		}
 	case pubsub.Event[message.Message]:
 		// Check if this is a child session message for an agent tool.
@@ -1551,6 +1558,9 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		}
 		cmds = append(cmds, m.sendMessage(content))
 		m.dialog.CloseFrontDialog()
+	case dialog.ActionAttachSkill:
+		m.dialog.CloseFrontDialog()
+		cmds = append(cmds, m.attachSkill(msg.ID, msg.Name))
 	case dialog.ActionRunMCPPrompt:
 		if len(msg.Arguments) > 0 && msg.Args == nil {
 			m.dialog.CloseFrontDialog()
@@ -1692,7 +1702,14 @@ func (m *UI) handleSelectModel(msg dialog.ActionSelectModel) tea.Cmd {
 			return util.ReportError(err)
 		}
 
-		modelMsg := fmt.Sprintf("%s model changed to %s", msg.ModelType, msg.Model.Model)
+		var (
+			modelType = stringext.Capitalize(string(msg.ModelType))
+			modelName = msg.Model.Model
+		)
+		if catwalkModel := cfg.GetModel(msg.Model.Provider, msg.Model.Model); catwalkModel != nil && catwalkModel.Name != "" {
+			modelName = catwalkModel.Name
+		}
+		modelMsg := fmt.Sprintf("%s model changed to %s", modelType, modelName)
 
 		return util.NewInfoMsg(modelMsg)
 	})
@@ -1795,6 +1812,16 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				return true
 			}
 			cmds = append(cmds, tea.Suspend)
+			return true
+		case key.Matches(msg, m.keyMap.ToggleYolo):
+			yolo := !m.com.Workspace.PermissionSkipRequests()
+			m.com.Workspace.PermissionSetSkipRequests(yolo)
+			m.setEditorPrompt(yolo)
+			status := "disabled"
+			if yolo {
+				status = "enabled"
+			}
+			cmds = append(cmds, util.ReportInfo("Yolo mode "+status))
 			return true
 		}
 		return false
@@ -2401,6 +2428,7 @@ func (m *UI) FullHelp() [][]key.Binding {
 			commands,
 			k.Models,
 			k.Sessions,
+			k.ToggleYolo,
 		)
 		if hasSession {
 			mainBinds = append(mainBinds, k.Chat.NewSession)
@@ -2462,6 +2490,7 @@ func (m *UI) FullHelp() [][]key.Binding {
 					commands,
 					k.Models,
 					k.Sessions,
+					k.ToggleYolo,
 				},
 			)
 			editorBinds := []key.Binding{
@@ -3136,10 +3165,35 @@ func (m *UI) refreshStyles() {
 		t.Attachments.Deleting,
 		t.Attachments.Image,
 		t.Attachments.Text,
+		t.Attachments.Skill,
 	)
 	m.todoSpinner.Style = t.Pills.TodoSpinner
 	m.status.help.Styles = t.Help
 	m.chat.InvalidateRenderCaches()
+}
+
+// attachSkill reads a skill's content by ID and returns it as a markdown
+// attachment to be added to the attachment toolbar. The user can then
+// compose a message and send it with the skill attached.
+// The name parameter is used as a fallback when the server does not
+// return one.
+func (m *UI) attachSkill(skillID, name string) tea.Cmd {
+	return func() tea.Msg {
+		content, result, err := m.com.Workspace.ReadSkill(context.Background(), skillID)
+		if err != nil {
+			return util.NewErrorMsg(err)
+		}
+		fileName := result.Name
+		if fileName == "" {
+			fileName = name
+		}
+		return message.Attachment{
+			FilePath: fileName,
+			FileName: fileName,
+			MimeType: "text/markdown",
+			Content:  content,
+		}
+	}
 }
 
 // sendMessage sends a message with the given content and attachments.
@@ -3467,6 +3521,7 @@ func (m *UI) newSession() tea.Cmd {
 	m.chat.Blur()
 	m.chat.ClearMessages()
 	m.pillsExpanded = false
+	m.pillsAutoExpanded = false
 	m.promptQueue = 0
 	m.pillsView = ""
 	m.historyReset()
